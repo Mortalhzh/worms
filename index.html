@@ -1,0 +1,1082 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<style>
+  html,body{margin:0;height:100%;background:#1a1d2b;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+  canvas{display:block}
+  #nm{position:fixed;left:50%;transform:translateX(-50%);width:min(280px,calc(100% - 60px));height:46px;box-sizing:border-box;
+    font:bold 18px sans-serif;text-align:center;color:#fff;background:#242842;border:2px solid rgba(255,255,255,0.25);
+    border-radius:14px;outline:none;display:none;z-index:5;user-select:text;-webkit-user-select:text}
+  #nm::placeholder{color:rgba(255,255,255,0.4)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<input id="nm" maxlength="12" placeholder="Your name" autocomplete="off">
+<script>
+const c = document.getElementById('c');
+const ctx = c.getContext('2d');
+const nm = document.getElementById('nm');
+function resize(){ c.width = innerWidth; c.height = innerHeight; }
+resize();
+addEventListener('resize', resize);
+
+const WORLD = 3000;
+const SPEED = 108;
+const BOOST_SPEED = 216;
+const MAX_TURN = 4.0;
+const SEG_GAP = 6;
+const SEG_COUNT = 14;
+const FOOD_COUNT = 900;
+const BASE_R = 9;
+const MAX_R = 24;
+const BOT_COUNT = 25;
+const BOARD_SIZE = 5;
+
+let NOW = 0;   // زمان فعلی برای طرح‌های متحرک
+
+// ---------- سختی ----------
+const DIFFS = [
+  { name: 'EASY',   speed: 0.9,  hunt: 0,    avoid: 0.2  },
+  { name: 'MEDIUM', speed: 1.0,  hunt: 0.35, avoid: 0.12 },
+  { name: 'HARD',   speed: 1.08, hunt: 0.8,  avoid: 0.07 },
+];
+
+// ---------- تنظیمات ذخیره‌شده ----------
+const settings = { name: '', sel: 0, diff: 0, sound: true };
+try {
+  const s = JSON.parse(localStorage.getItem('wormSettings') || 'null');
+  if (s) Object.assign(settings, s);
+} catch (e) {}
+function saveSettings(){ try { localStorage.setItem('wormSettings', JSON.stringify(settings)); } catch (e) {} }
+function playerName(){ return (settings.name || '').trim() || 'YOU'; }
+nm.value = settings.name || '';
+nm.addEventListener('input', () => { settings.name = nm.value.slice(0, 12); saveSettings(); });
+
+// ---------- رکورد ----------
+let best = 0;
+try { best = parseInt(localStorage.getItem('wormBest') || '0', 10) || 0; } catch (e) {}
+function saveBest(){ try { localStorage.setItem('wormBest', String(best)); } catch (e) {} }
+
+// ---------- صدا ----------
+let actx = null;
+function initAudio(){
+  if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (actx && actx.state === 'suspended') actx.resume();
+}
+function beep(freq, dur, type, vol, slideTo){
+  if (!settings.sound || !actx) return;
+  try {
+    const o = actx.createOscillator(), g = actx.createGain();
+    const t = actx.currentTime;
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    g.gain.setValueAtTime(vol || 0.1, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(t); o.stop(t + dur);
+  } catch (e) {}
+}
+let lastEat = 0;
+function sfxEat(){ const t = performance.now(); if (t - lastEat < 70) return; lastEat = t; beep(520 + Math.random()*180, 0.08, 'sine', 0.06, 900); }
+function sfxDie(){ beep(400, 0.5, 'sawtooth', 0.12, 60); }
+function sfxBoost(){ beep(180, 0.25, 'triangle', 0.07, 420); }
+function sfxKill(){ beep(300, 0.18, 'square', 0.05, 120); }
+function sfxRecord(){
+  setTimeout(() => beep(660, 0.12, 'square', 0.07), 350);
+  setTimeout(() => beep(880, 0.12, 'square', 0.07), 480);
+  setTimeout(() => beep(1175, 0.2, 'square', 0.07), 610);
+}
+
+// ---------- طرح‌ها ----------
+const hsl = (h, s, l) => 'hsl(' + ((h % 360 + 360) % 360) + ',' + s + '%,' + l + '%)';
+
+// طرح‌های معمولی (دشمن‌ها و حالت تصادفی از این‌ها استفاده می‌کنن)
+const SKINS = [
+  { name: 'rainbow', head: '#7CFC00',
+    color: i => ['#ff4d6d','#ff9f1c','#ffd60a','#7CFC00','#00d4ff','#4d7cff','#b44dff'][i % 7] },
+  { name: 'fire', head: '#ff9f1c',
+    color: i => hsl(350 + 50 * (0.5 + 0.5 * Math.sin(i * 0.5)), 95, 58) },
+  { name: 'ocean', head: '#00e5ff',
+    color: i => hsl(170 + 60 * (0.5 + 0.5 * Math.sin(i * 0.45)), 85, 55) },
+  { name: 'bee', head: '#ffd60a',
+    color: i => (i % 4 < 2) ? '#ffd60a' : '#2b2b2b' },
+  { name: 'candy', head: '#ff7eb6',
+    color: i => (i % 2) ? '#ff7eb6' : '#ffffff' },
+  { name: 'neon', head: '#e040fb',
+    color: i => hsl(260 + 70 * (0.5 + 0.5 * Math.sin(i * 0.4)), 90, 62) },
+  { name: 'spectrum', head: '#ffffff',
+    color: i => hsl(i * 22, 90, 60) },
+  { name: 'zebra', head: '#ffffff',
+    color: i => (i % 2) ? '#ffffff' : '#15151c' },
+  { name: 'toxic', head: '#39ff14',
+    color: i => (i % 3 === 0) ? '#15151c' : '#39ff14' },
+  { name: 'ice', head: '#e8fbff',
+    color: i => hsl(195 + 20 * Math.sin(i * 0.3), 85, 70 + 15 * Math.sin(i * 0.6)) },
+  { name: 'lava', head: '#ffdd55',
+    color: i => hsl(8 + 30 * (0.5 + 0.5 * Math.sin(i * 0.7)), 100, 35 + 25 * (0.5 + 0.5 * Math.sin(i * 0.35))) },
+  { name: 'galaxy', head: '#c9b6ff',
+    color: i => (i % 6 === 0) ? '#ffffff' : hsl(250 + 40 * Math.sin(i * 0.3), 70, 32) },
+  { name: 'gold', head: '#fff2a8',
+    color: i => (i % 2) ? '#ffd60a' : '#b8860b' },
+  { name: 'choco', head: '#9df5d0',
+    color: i => ['#5a3825', '#5a3825', '#9df5d0'][i % 3] },
+  { name: 'camo', head: '#a39e6b',
+    color: i => ['#4b5320', '#78866b', '#3b3f2a', '#a39e6b'][Math.floor(i / 2) % 4] },
+  { name: 'sunset', head: '#ffe08a',
+    color: i => hsl(280 + 100 * (0.5 + 0.5 * Math.sin(i * 0.25)), 90, 60) },
+  { name: 'cherry', head: '#ff5577',
+    color: i => (i % 5 === 0) ? '#ffffff' : '#e0143c' },
+  { name: 'checker', head: '#ffffff',
+    color: i => ['#ff4d6d', '#4d7cff'][Math.floor(i / 3) % 2] },
+  { name: 'pastel', head: '#ffffff',
+    color: i => hsl(i * 35, 70, 82) },
+  { name: 'ghost', head: '#ffffff',
+    color: i => (i % 2) ? 'rgba(255,255,255,0.9)' : 'rgba(170,195,255,0.55)' },
+  { name: 'pirate', head: '#e0143c',
+    color: i => (i % 6 < 3) ? '#e0143c' : '#15151c' },
+  { name: 'bluegrad', head: '#7fd8ff',
+    color: i => hsl(220, 80, 30 + 40 * (0.5 + 0.5 * Math.sin(i * 0.3))) },
+];
+
+// طرح‌های اختصاصی (فقط برای خودت، بیشترشون متحرک)
+const VIP_SKINS = [
+  { name: 'Dragon', vip: true, head: '#ffcc33',
+    color: i => hsl(8 + 38 * (0.5 + 0.5 * Math.sin(i * 0.45 - NOW * 0.006)), 100, 45 + 15 * Math.sin(i * 0.45 - NOW * 0.006)) },
+  { name: 'Aurora', vip: true, head: '#b8ffec',
+    color: i => hsl(140 + 130 * (0.5 + 0.5 * Math.sin(i * 0.22 - NOW * 0.002)), 85, 55) },
+  { name: 'Matrix', vip: true, head: '#eafff0',
+    color: i => hsl(125, 100, 12 + 48 * Math.max(0, Math.sin(i * 0.5 - NOW * 0.01))) },
+  { name: 'Cyber', vip: true, head: '#ffffff',
+    color: i => (Math.floor(i / 2 + NOW * 0.004) % 2) ? '#00f0ff' : '#ff2bd6' },
+  { name: 'Diamond', vip: true, head: '#ffffff',
+    color: i => Math.sin(i * 0.9 - NOW * 0.012) > 0.85 ? '#ffffff' : hsl(190, 70, 55 + 12 * Math.sin(i * 0.5)) },
+  { name: 'Royal', vip: true, head: '#ffd60a',
+    color: i => (i % 3 === 0) ? '#ffd60a' : hsl(270, 65, 38) },
+  { name: 'Plasma', vip: true, head: '#ffffff',
+    color: i => hsl(NOW * 0.12 + i * 14, 100, 60) },
+  { name: 'Shadow', vip: true, head: '#ff1744',
+    color: i => (i % 2) ? '#1b1b26' : hsl(350, 80, 25 + 20 * Math.max(0, Math.sin(i * 0.4 - NOW * 0.006))) },
+  { name: 'Storm', vip: true, head: '#ffffff',
+    color: i => Math.sin(i * 1.7 + NOW * 0.03) > 0.93 ? '#fff6a8' : hsl(225, 45, 28 + 10 * Math.sin(i * 0.3)) },
+  { name: 'Sakura', vip: true, head: '#fff0f5',
+    color: i => hsl(335 + 12 * Math.sin(i * 0.6), 80, 78 + 10 * Math.sin(i * 0.9)) },
+];
+
+// لیست منو: اول RANDOM، بعد اختصاصی‌ها، بعد معمولی‌ها
+const MENU_SKINS = [{ name: 'RANDOM', random: true }].concat(VIP_SKINS, SKINS);
+if (settings.sel < 0 || settings.sel >= MENU_SKINS.length) settings.sel = 0;
+if (settings.diff < 0 || settings.diff > 2) settings.diff = 0;
+
+let skin = SKINS[0];
+function pickSkin(){
+  const m = MENU_SKINS[settings.sel];
+  if (m.random) {
+    let s;
+    do { s = SKINS[Math.floor(Math.random() * SKINS.length)]; } while (s === skin);
+    skin = s;
+  } else {
+    skin = m;
+  }
+}
+
+const NAMES = ['Owen','Kate','Liam','Mia','Noah','Zoe','Ethan','Ava','Leo','Ivy',
+  'Max','Luna','Finn','Nora','Jack','Ella','Sam','Ruby','Adam','Lily',
+  'Ben','Cleo','Dan','Eva','Gus','Hana','Ian','Jade','Kai','Lola',
+  'Milo','Nina','Omar','Pia','Quin','Rex','Sara','Theo','Uma','Vic',
+  'GooString','Wren','Yara','Zack'];
+
+const rand = (a, b) => a + Math.random() * (b - a);
+
+// ---------- وضعیت بازی ----------
+let state = 'menu';        // 'menu' | 'play' | 'over'
+let overT = 0;
+let finalScore = 0;
+let newRecord = false;
+const overBtn = { x: 0, y: 0, w: 0, h: 0 };
+const menuBtn = { x: 0, y: 0, w: 0, h: 0 };
+
+// ---------- کرم‌ها ----------
+function makeWorm(x, y, segCount, sk){
+  const w = { x, y, angle: Math.random() * 6.28, desired: 0, r: BASE_R,
+    segs: [], score: 0, growth: 0, skin: sk, boost: false, boostLevel: 0,
+    name: '', safe: 0, speedMul: 1, ai: { retarget: 0, boostT: 0, avoidT: 0, turnSide: 0 } };
+  w.desired = w.angle;
+  for (let i = 0; i < segCount; i++) w.segs.push({ x: x - i*SEG_GAP, y });
+  return w;
+}
+
+const worm = makeWorm(WORLD/2, WORLD/2, SEG_COUNT, skin);
+worm.angle = 0; worm.desired = 0; worm.name = 'YOU';
+
+function resetWorm(){
+  const w = makeWorm(WORLD/2, WORLD/2, SEG_COUNT, skin);
+  w.angle = 0; w.desired = 0; w.name = playerName();
+  Object.assign(worm, w);
+}
+
+// ---------- غذا ----------
+const FOOD_COLORS = ['#ff4d6d','#ff9f1c','#ffd60a','#7CFC00','#00d4ff','#4d7cff','#b44dff','#ff7eb6'];
+const foods = [];
+function newFood(){
+  const big = Math.random() < 0.08;
+  return {
+    x: 40 + Math.random() * (WORLD - 80),
+    y: 40 + Math.random() * (WORLD - 80),
+    r: big ? 11 : 5 + Math.random() * 2,
+    v: big ? 5 : 1,
+    col: FOOD_COLORS[Math.floor(Math.random() * FOOD_COLORS.length)],
+    eaten: false, t: 0, by: null, temp: false,
+    ph: Math.random() * 6.28
+  };
+}
+for (let i = 0; i < FOOD_COUNT; i++) foods.push(newFood());
+
+
+
+function spawnDeathFood(w){
+  // کل بدن (از سر تا دم) به یک ردیف غذای چسبیده تبدیل میشه
+  const total = Math.max(w.score, 6);
+  const step = Math.max(1, Math.ceil(w.segs.length / 80));
+  const pts = [{ x: w.x, y: w.y, i: 0 }];
+  for (let i = 0; i < w.segs.length; i += step) pts.push({ x: w.segs[i].x, y: w.segs[i].y, i: i });
+  const v = total / pts.length;
+  const r = Math.max(5, Math.min(22, Math.max(w.r * 0.7, step * SEG_GAP * 0.6)));
+  for (const p of pts) {
+    foods.push({
+      x: p.x + rand(-2, 2), y: p.y + rand(-2, 2),
+      r: r, v: v, col: w.skin.color(p.i),
+      eaten: false, t: 0, by: null, temp: true,
+      ph: Math.random() * 6.28
+    });
+  }
+}
+
+// ---------- دشمن‌ها ----------
+const bots = [];
+function giveScore(w, pts){
+  w.score += pts;
+  w.growth += pts;
+  while (w.growth >= 3) {
+    w.growth -= 3;
+    const l = w.segs[w.segs.length - 1];
+    w.segs.push({ x: l.x, y: l.y });
+  }
+  w.r = Math.min(MAX_R, BASE_R + w.score * 0.02);
+}
+function spawnBot(avoid){
+  let x, y, tries = 0;
+  do {
+    x = rand(200, WORLD - 200); y = rand(200, WORLD - 200);
+    tries++;
+  } while (avoid && tries < 30 && Math.hypot(x - avoid.x, y - avoid.y) < 700);
+  const roll = Math.random();
+  let startScore;
+  if (roll < 0.5) startScore = rand(0, 60);
+  else if (roll < 0.85) startScore = rand(60, 300);
+  else startScore = rand(300, 1200);
+  const sk = SKINS[Math.floor(Math.random() * SKINS.length)];
+  const b = makeWorm(x, y, SEG_COUNT, sk);
+  b.name = NAMES[Math.floor(Math.random() * NAMES.length)];
+  giveScore(b, Math.floor(startScore));
+  b.ai.retarget = rand(0, 0.5);
+  return b;
+}
+for (let i = 0; i < BOT_COUNT; i++) bots.push(spawnBot(null));
+
+// ---------- رتبه‌بندی ----------
+let ranking = [];
+let rankTimer = 0;
+function updateRanking(){
+  ranking = (state === 'play') ? [worm].concat(bots) : bots.slice();
+  ranking.sort((a, b) => b.score - a.score);
+}
+updateRanking();
+
+// ---------- شروع / مرگ ----------
+function startGame(){
+  initAudio();
+  try { nm.blur(); } catch (e) {}
+  pickSkin();
+  resetWorm();
+  worm.safe = 2;
+  joy.active = false; joy.id = null;
+  btn.pressed = false; btn.id = null;
+  state = 'play';
+  updateRanking();
+}
+function goMenu(){
+  state = 'menu';
+  joy.active = false; btn.pressed = false;
+  updateRanking();
+}
+function gameOver(){
+  if (state !== 'play') return;
+  state = 'over';
+  overT = 0;
+  finalScore = Math.floor(worm.score);
+  newRecord = finalScore > best;
+  if (newRecord) { best = finalScore; saveBest(); sfxRecord(); }
+  sfxDie();
+  spawnDeathFood(worm);
+  joy.active = false; joy.id = null;
+  btn.pressed = false; btn.id = null;
+  worm.boost = false;
+  updateRanking();
+}
+function killBot(b){
+  const i = bots.indexOf(b);
+  if (i < 0) return;
+  if (state === 'play' && Math.hypot(b.x - worm.x, b.y - worm.y) < 600) sfxKill();
+  spawnDeathFood(b);
+  bots[i] = spawnBot(state === 'play' ? worm : null);
+}
+
+// ---------- ورودی ----------
+let boostLevel = 0;
+const JOY_R = 45;
+const KNOB_R = 20;
+const joy = { active: false, id: null, ox: 0, oy: 0, x: 0, y: 0 };
+
+const btn = { x: 0, y: 0, size: 110, pressed: false, id: null };
+function placeBtn(){
+  btn.x = 30;
+  btn.y = c.height - btn.size - 40;
+}
+placeBtn();
+addEventListener('resize', placeBtn);
+
+const hit = (r, x, y) => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+function inBtn(x, y){
+  return x >= btn.x && x <= btn.x + btn.size && y >= btn.y && y <= btn.y + btn.size;
+}
+
+// دکمه‌های منو (هر فریم در drawMenu پر میشن)
+const MR = {
+  left: { x:0, y:0, w:0, h:0 }, right: { x:0, y:0, w:0, h:0 },
+  diff: [{ x:0, y:0, w:0, h:0 }, { x:0, y:0, w:0, h:0 }, { x:0, y:0, w:0, h:0 }],
+  sound: { x:0, y:0, w:0, h:0 }, play: { x:0, y:0, w:0, h:0 }
+};
+function menuTap(x, y){
+  try { nm.blur(); } catch (e) {}
+  initAudio();
+  const n = MENU_SKINS.length;
+  if (hit(MR.left, x, y)) { settings.sel = (settings.sel - 1 + n) % n; saveSettings(); return; }
+  if (hit(MR.right, x, y)) { settings.sel = (settings.sel + 1) % n; saveSettings(); return; }
+  for (let i = 0; i < 3; i++) if (hit(MR.diff[i], x, y)) { settings.diff = i; saveSettings(); return; }
+  if (hit(MR.sound, x, y)) { settings.sound = !settings.sound; saveSettings(); beep(600, 0.08, 'sine', 0.08); return; }
+  if (hit(MR.play, x, y)) { startGame(); return; }
+}
+function overTap(x, y){
+  if (overT <= 0.5) return;
+  if (hit(overBtn, x, y)) startGame();
+  else if (hit(menuBtn, x, y)) goMenu();
+}
+
+c.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (state === 'menu') { for (const t of e.changedTouches) menuTap(t.clientX, t.clientY); return; }
+  if (state === 'over') { for (const t of e.changedTouches) overTap(t.clientX, t.clientY); return; }
+  for (const t of e.changedTouches) {
+    if (inBtn(t.clientX, t.clientY)) {
+      btn.pressed = true; btn.id = t.identifier;
+    } else if (!joy.active) {
+      joy.active = true; joy.id = t.identifier;
+      joy.ox = joy.x = t.clientX;
+      joy.oy = joy.y = t.clientY;
+    }
+  }
+}, { passive: false });
+
+c.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (state !== 'play') return;
+  for (const t of e.changedTouches) {
+    if (joy.active && t.identifier === joy.id) {
+      let dx = t.clientX - joy.ox, dy = t.clientY - joy.oy;
+      const d = Math.hypot(dx, dy);
+      if (d > JOY_R) { dx = dx/d*JOY_R; dy = dy/d*JOY_R; }
+      joy.x = joy.ox + dx;
+      joy.y = joy.oy + dy;
+      if (d > 6) worm.desired = Math.atan2(dy, dx);
+    }
+  }
+}, { passive: false });
+
+function endTouch(e){
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    if (t.identifier === joy.id) { joy.active = false; joy.id = null; }
+    if (t.identifier === btn.id) { btn.pressed = false; btn.id = null; }
+  }
+}
+c.addEventListener('touchend', endTouch, { passive: false });
+c.addEventListener('touchcancel', endTouch, { passive: false });
+
+let mouseDown = false;
+c.addEventListener('mousedown', e => {
+  if (state === 'menu') { menuTap(e.clientX, e.clientY); return; }
+  if (state === 'over') { overTap(e.clientX, e.clientY); return; }
+  if (inBtn(e.clientX, e.clientY)) { btn.pressed = true; return; }
+  mouseDown = true; joy.active = true;
+  joy.ox = joy.x = e.clientX; joy.oy = joy.y = e.clientY;
+});
+c.addEventListener('mousemove', e => {
+  if (!mouseDown || state !== 'play') return;
+  let dx = e.clientX - joy.ox, dy = e.clientY - joy.oy;
+  const d = Math.hypot(dx, dy);
+  if (d > JOY_R) { dx = dx/d*JOY_R; dy = dy/d*JOY_R; }
+  joy.x = joy.ox + dx; joy.y = joy.oy + dy;
+  if (d > 6) worm.desired = Math.atan2(dy, dx);
+});
+addEventListener('mouseup', () => { mouseDown = false; joy.active = false; btn.pressed = false; });
+
+// ---------- حرکت ----------
+function moveWorm(w, dt){
+  let diff = w.desired - w.angle;
+  while (diff > Math.PI) diff -= Math.PI*2;
+  while (diff < -Math.PI) diff += Math.PI*2;
+  const maxStep = MAX_TURN * dt;
+  w.angle += Math.max(-maxStep, Math.min(maxStep, diff));
+
+  const sp = (w.boost ? BOOST_SPEED : SPEED) * (w.speedMul || 1) * dt;
+  w.x += Math.cos(w.angle) * sp;
+  w.y += Math.sin(w.angle) * sp;
+
+  let prev = { x: w.x, y: w.y };
+  for (const s of w.segs) {
+    const dx = prev.x - s.x, dy = prev.y - s.y;
+    const d = Math.hypot(dx, dy);
+    if (d > SEG_GAP) {
+      s.x = prev.x - dx/d * SEG_GAP;
+      s.y = prev.y - dy/d * SEG_GAP;
+    }
+    prev = s;
+  }
+  w.boostLevel += ((w.boost ? 1 : 0) - w.boostLevel) * Math.min(1, dt * 10);
+}
+
+// ---------- برخورد ----------
+function allWorms(){
+  return state === 'play' ? [worm].concat(bots) : bots;
+}
+function hitsAny(w, list){
+  for (const o of list) {
+    if (o === w) continue;
+    const lim = (w.r + o.r) * 0.75;
+    const lim2 = lim * lim;
+    for (const s of o.segs) {
+      const dx = s.x - w.x;
+      if (dx > lim || dx < -lim) continue;
+      const dy = s.y - w.y;
+      if (dx*dx + dy*dy < lim2) return true;
+    }
+  }
+  return false;
+}
+function dangerAt(b, px, py, list){
+  for (const o of list) {
+    if (o === b) continue;
+    const lim = o.r + b.r + 8;
+    const lim2 = lim * lim;
+    for (const s of o.segs) {
+      const dx = s.x - px;
+      if (dx > lim || dx < -lim) continue;
+      const dy = s.y - py;
+      if (dx*dx + dy*dy < lim2) return true;
+    }
+  }
+  return false;
+}
+
+// ---------- هوش مصنوعی ----------
+function updateBot(b, dt, list){
+  const ai = b.ai;
+  const D = DIFFS[settings.diff];
+  b.speedMul = D.speed;
+  ai.retarget -= dt;
+  ai.boostT -= dt;
+  ai.avoidT -= dt;
+
+  let avoiding = false;
+  if (ai.avoidT <= 0) {
+    ai.avoidT = D.avoid;
+    const ca = Math.cos(b.angle), sa = Math.sin(b.angle);
+    const d1 = 35 + b.r, d2 = 75 + b.r;
+    if (dangerAt(b, b.x + ca*d1, b.y + sa*d1, list) ||
+        dangerAt(b, b.x + ca*d2, b.y + sa*d2, list)) {
+      ai.turnSide = ai.turnSide || (Math.random() < 0.5 ? -1 : 1);
+      b.desired = b.angle + ai.turnSide * 1.7;
+      b.boost = false;
+      ai.retarget = 0.35;
+      avoiding = true;
+    } else {
+      ai.turnSide = 0;
+    }
+  }
+
+  const M = 260;
+  if (b.x < M || b.y < M || b.x > WORLD - M || b.y > WORLD - M) {
+    b.desired = Math.atan2(WORLD/2 - b.y, WORLD/2 - b.x);
+    b.boost = false;
+  } else if (!avoiding && ai.retarget <= 0) {
+    ai.retarget = rand(0.4, 1.0);
+    let hunted = false;
+    // شکار بازیکن (فقط در سختی بالاتر)
+    if (state === 'play' && Math.random() < D.hunt) {
+      const dx = worm.x - b.x, dy = worm.y - b.y;
+      if (dx*dx + dy*dy < 450*450) {
+        const tx = worm.x + Math.cos(worm.angle) * 90;
+        const ty = worm.y + Math.sin(worm.angle) * 90;
+        b.desired = Math.atan2(ty - b.y, tx - b.x);
+        ai.retarget = 0.35;
+        hunted = true;
+      }
+    }
+    if (!hunted) {
+      let bestF = null, bd = 1e9;
+      for (const f of foods) {
+        if (f.eaten) continue;
+        const dx = f.x - b.x, dy = f.y - b.y;
+        if (Math.abs(dx) > 500 || Math.abs(dy) > 500) continue;
+        const d = (dx*dx + dy*dy) / (f.v > 1 ? 3 : 1);
+        if (d < bd) { bd = d; bestF = f; }
+      }
+      if (bestF && Math.random() > 0.12) {
+        b.desired = Math.atan2(bestF.y - b.y, bestF.x - b.x);
+      } else {
+        b.desired = b.angle + rand(-1.2, 1.2);
+      }
+    }
+    if (ai.boostT <= 0) {
+      b.boost = Math.random() < 0.12;
+      ai.boostT = rand(1, 3);
+    }
+  }
+
+  moveWorm(b, dt);
+
+  b.x = Math.max(5, Math.min(WORLD - 5, b.x));
+  b.y = Math.max(5, Math.min(WORLD - 5, b.y));
+}
+
+// ---------- غذا خوردن ----------
+function eatFor(w){
+  let n = 0;
+  const eatR = w.r + 14;
+  for (let i = 0; i < foods.length; i++) {
+    const f = foods[i];
+    if (f.eaten) continue;
+    const dx = f.x - w.x, dy = f.y - w.y;
+    if (Math.abs(dx) > eatR + 24 || Math.abs(dy) > eatR + 24) continue;
+    if (Math.hypot(dx, dy) < eatR + f.r) {
+      f.eaten = true;
+      f.by = w;
+      giveScore(w, f.v);
+      n++;
+    }
+  }
+  return n;
+}
+
+let prevBoost = false;
+function update(dt){
+  if (state === 'play') {
+    worm.boost = btn.pressed;
+    if (btn.pressed && !prevBoost) sfxBoost();
+    prevBoost = btn.pressed;
+    moveWorm(worm, dt);
+    boostLevel = worm.boostLevel;
+    if (worm.safe > 0) worm.safe -= dt;
+
+    if (worm.x <= 0 || worm.y <= 0 || worm.x >= WORLD || worm.y >= WORLD) {
+      gameOver();
+    } else if (eatFor(worm) > 0) {
+      sfxEat();
+    }
+  } else {
+    overT += dt;
+    prevBoost = false;
+  }
+
+  const list = allWorms();
+  for (const b of bots) { updateBot(b, dt, list); eatFor(b); }
+
+  const kills = [];
+  if (state === 'play' && worm.safe <= 0 && hitsAny(worm, bots)) gameOver();
+  for (const b of bots) {
+    if (hitsAny(b, list)) kills.push(b);
+  }
+  for (const b of kills) killBot(b);
+
+  for (let i = foods.length - 1; i >= 0; i--) {
+    const f = foods[i];
+    if (!f.eaten) continue;
+    f.t += dt * 6;
+    const tgt = f.by || worm;
+    f.x += (tgt.x - f.x) * Math.min(1, dt * 14);
+    f.y += (tgt.y - f.y) * Math.min(1, dt * 14);
+    if (f.t >= 1) {
+      if (f.temp) foods.splice(i, 1);
+      else foods[i] = newFood();
+    }
+  }
+
+  rankTimer -= dt;
+  if (rankTimer <= 0) { rankTimer = 0.3; updateRanking(); }
+}
+
+// ---------- تاج ----------
+function drawCrown(x, y, s){
+  ctx.save();
+  ctx.shadowColor = '#ffd60a';
+  ctx.shadowBlur = 10;
+  ctx.fillStyle = '#ffd60a';
+  ctx.beginPath();
+  ctx.moveTo(x - 11*s, y + 8*s);
+  ctx.lineTo(x - 13*s, y - 7*s);
+  ctx.lineTo(x - 6*s,  y - 1*s);
+  ctx.lineTo(x,        y - 10*s);
+  ctx.lineTo(x + 6*s,  y - 1*s);
+  ctx.lineTo(x + 13*s, y - 7*s);
+  ctx.lineTo(x + 11*s, y + 8*s);
+  ctx.closePath();
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#ff9f1c';
+  ctx.fillRect(x - 11*s, y + 4*s, 22*s, 4*s);
+  ctx.restore();
+}
+
+// ---------- کشیدن ----------
+function drawWormBody(w, time, detailed){
+  const segs = w.segs;
+  const bl = w.boostLevel;
+  for (let i = segs.length - 1; i >= 0; i--) {
+    const s = segs[i];
+    const col = w.skin.color(i);
+    ctx.fillStyle = col;
+    if (detailed && bl > 0.02) {
+      const pulse = 0.5 + 0.5 * Math.sin(time * 0.012 - i * 0.55);
+      ctx.shadowColor = col;
+      ctx.shadowBlur = (8 + 14 * pulse) * bl;
+      ctx.beginPath(); ctx.arc(s.x, s.y, w.r, 0, Math.PI*2); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(255,255,255,' + (0.45 * pulse * bl) + ')';
+      ctx.beginPath(); ctx.arc(s.x, s.y, w.r, 0, Math.PI*2); ctx.fill();
+    } else {
+      ctx.beginPath(); ctx.arc(s.x, s.y, w.r, 0, Math.PI*2); ctx.fill();
+    }
+  }
+  ctx.fillStyle = w.skin.head;
+  if (detailed && bl > 0.02) { ctx.shadowColor = w.skin.head; ctx.shadowBlur = 18 * bl; }
+  ctx.beginPath(); ctx.arc(w.x, w.y, w.r, 0, Math.PI*2); ctx.fill();
+  ctx.shadowBlur = 0;
+
+  const k = w.r / 14;
+  const ex = Math.cos(w.angle), ey = Math.sin(w.angle);
+  const px = -ey, py = ex;
+  ctx.fillStyle = '#fff';
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.arc(w.x + ex*6*k + px*6*k*s, w.y + ey*6*k + py*6*k*s, 4*k, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.fillStyle = '#000';
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.arc(w.x + ex*8*k + px*6*k*s, w.y + ey*8*k + py*6*k*s, 2*k, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+function wormVisible(w, camX, camY){
+  const pad = 60;
+  const x0 = camX - pad, x1 = camX + c.width + pad;
+  const y0 = camY - pad, y1 = camY + c.height + pad;
+  if (w.x > x0 && w.x < x1 && w.y > y0 && w.y < y1) return true;
+  for (let i = 0; i < w.segs.length; i += 4) {
+    const s = w.segs[i];
+    if (s.x > x0 && s.x < x1 && s.y > y0 && s.y < y1) return true;
+  }
+  return false;
+}
+
+function cameraTarget(){
+  if (state === 'menu' && ranking[0]) return ranking[0];
+  return worm;
+}
+
+function drawWorld(time){
+  const cam = cameraTarget();
+  const camX = cam.x - c.width/2;
+  const camY = cam.y - c.height/2;
+  const leader = ranking[0];
+  ctx.save();
+  ctx.translate(-camX, -camY);
+
+  ctx.fillStyle = '#2a2e45';
+  const step = 60;
+  const x0 = Math.floor(camX/step)*step, y0 = Math.floor(camY/step)*step;
+  for (let x = x0; x < camX + c.width + step; x += step)
+    for (let y = y0; y < camY + c.height + step; y += step) {
+      if (x < 0 || y < 0 || x > WORLD || y > WORLD) continue;
+      ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI*2); ctx.fill();
+    }
+
+  ctx.strokeStyle = '#ff4d6d';
+  ctx.lineWidth = 6;
+  ctx.strokeRect(0, 0, WORLD, WORLD);
+
+  for (const f of foods) {
+    if (f.x < camX - 30 || f.x > camX + c.width + 30 ||
+        f.y < camY - 30 || f.y > camY + c.height + 30) continue;
+    const tw = 1 + 0.15 * Math.sin(time * 0.005 + f.ph);
+    const k = f.eaten ? (1 - f.t) : 1;
+    ctx.globalAlpha = Math.max(0, k);
+    ctx.fillStyle = f.col;
+    ctx.shadowColor = f.temp ? "#ffffff" : f.col;
+    ctx.shadowBlur = f.temp ? 16 : (f.v > 1 ? 14 : 6);
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, f.r * tw * k, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.shadowBlur = 0;
+
+  ctx.textAlign = 'center';
+  for (const b of bots) {
+    if (!wormVisible(b, camX, camY)) continue;
+    drawWormBody(b, time, false);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillText(b.name, b.x, b.y + b.r + 20);
+  }
+
+  if (state === 'play') {
+    if (worm.safe > 0) ctx.globalAlpha = 0.45 + 0.4 * Math.sin(time * 0.02);
+    drawWormBody(worm, time, true);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.fillText(worm.name, worm.x, worm.y + worm.r + 20);
+  }
+
+  if (leader && (leader === worm || wormVisible(leader, camX, camY))) {
+    const bob = Math.sin(time * 0.004) * 2;
+    drawCrown(leader.x, leader.y - leader.r - 16 + bob, 1 + leader.r / 40);
+  }
+
+  ctx.restore();
+}
+
+function drawLeaderArrow(){
+  const leader = ranking[0];
+  if (!leader || leader === worm) return;
+  const dx = leader.x - worm.x, dy = leader.y - worm.y;
+  const hw = c.width/2 - 40, hh = c.height/2 - 60;
+  const t = Math.min(hw / Math.max(1, Math.abs(dx)), hh / Math.max(1, Math.abs(dy)));
+  if (t >= 1) return;
+  const sx = c.width/2 + dx * t;
+  const sy = c.height/2 + dy * t;
+  drawCrown(sx, sy, 1.1);
+  const a = Math.atan2(dy, dx);
+  ctx.save();
+  ctx.translate(sx + Math.cos(a) * 24, sy + Math.sin(a) * 24);
+  ctx.rotate(a);
+  ctx.fillStyle = '#ffd60a';
+  ctx.beginPath();
+  ctx.moveTo(8, 0); ctx.lineTo(-5, -6); ctx.lineTo(-5, 6);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+
+// ---------- مینی‌مپ ----------
+function drawBoard(){
+  const right = c.width - 12;
+  const left = c.width - 130;
+  const rowH = 16;
+  let y = 34;
+  ctx.font = 'bold 11px sans-serif';
+
+  const rows = BOARD_SIZE + 1;
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.roundRect(left - 8, y - 14, 134, rows * rowH + 8, 8);
+  ctx.fill();
+
+  const myRank = ranking.indexOf(worm);
+  const shown = ranking.slice(0, BOARD_SIZE);
+  for (let i = 0; i < shown.length; i++) {
+    const w = shown[i];
+    const me = (w === worm);
+    ctx.fillStyle = me ? '#7CFC00' : (i === 0 ? '#ffd60a' : '#fff');
+    ctx.textAlign = 'left';
+    ctx.fillText((i + 1) + ' ' + w.name, left, y);
+    ctx.textAlign = 'right';
+    ctx.fillText(Math.floor(w.score), right, y);
+    y += rowH;
+  }
+  if (myRank >= BOARD_SIZE) {
+    ctx.fillStyle = '#7CFC00';
+    ctx.textAlign = 'left';
+    ctx.fillText((myRank + 1) + ' ' + worm.name, left, y + 3);
+    ctx.textAlign = 'right';
+    ctx.fillText(Math.floor(worm.score), right, y + 3);
+  }
+}
+
+function drawMinimap(){
+  const S = 92;
+  const x = 14, y = 14;
+  const sc = S / WORLD;
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath(); ctx.roundRect(x, y, S, S, 8); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  ctx.fillStyle = '#8a90b8';
+  for (const b of bots) {
+    if (b === ranking[0]) continue;
+    ctx.fillRect(x + b.x * sc - 1, y + b.y * sc - 1, 2, 2);
+  }
+  const L = ranking[0];
+  if (L && L !== worm) {
+    ctx.fillStyle = '#ffd60a';
+    ctx.beginPath(); ctx.arc(x + L.x * sc, y + L.y * sc, 3, 0, Math.PI*2); ctx.fill();
+  }
+  // مستطیل دید
+  const vx = Math.max(0, worm.x - c.width/2), vy = Math.max(0, worm.y - c.height/2);
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + vx * sc, y + vy * sc,
+    Math.min(c.width, WORLD - vx) * sc, Math.min(c.height, WORLD - vy) * sc);
+  // بازیکن
+  ctx.fillStyle = '#7CFC00';
+  ctx.beginPath(); ctx.arc(x + worm.x * sc, y + worm.y * sc, 3.5, 0, Math.PI*2); ctx.fill();
+}
+
+// ---------- منو ----------
+function drawBtn(r, label, fill, textCol, size){
+  ctx.fillStyle = fill;
+  ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 14); ctx.fill();
+  ctx.fillStyle = textCol;
+  ctx.font = 'bold ' + size + 'px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(label, r.x + r.w/2, r.y + r.h/2 + size * 0.36);
+}
+function setRect(r, x, y, w, h){ r.x = x; r.y = y; r.w = w; r.h = h; }
+
+function drawPreview(sk, cx, cy, time){
+  const n = 18;
+  const sp = Math.min(15, (c.width - 150) / n);
+  const rad = sp * 0.85;
+  const hx = cx + (n / 2) * sp;
+  const wave = i => cy + Math.sin(time * 0.004 + i * 0.5) * 10;
+  if (sk.vip) { ctx.shadowColor = sk.head; ctx.shadowBlur = 10; }
+  for (let i = n - 1; i >= 0; i--) {
+    ctx.fillStyle = sk.color(i);
+    ctx.beginPath();
+    ctx.arc(hx - (i + 1) * sp, wave(i), rad, 0, Math.PI*2);
+    ctx.fill();
+  }
+  const hy = wave(-1);
+  ctx.fillStyle = sk.head;
+  ctx.beginPath(); ctx.arc(hx, hy, rad * 1.05, 0, Math.PI*2); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(hx + 2, hy - rad*0.45, rad*0.33, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(hx + 2, hy + rad*0.45, rad*0.33, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.arc(hx + 3.5, hy - rad*0.45, rad*0.16, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(hx + 3.5, hy + rad*0.45, rad*0.16, 0, Math.PI*2); ctx.fill();
+}
+
+function drawMenu(time){
+  const W = c.width, H = c.height;
+  ctx.fillStyle = 'rgba(10,12,24,0.72)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+
+  ctx.fillStyle = '#7CFC00';
+  ctx.font = 'bold 46px sans-serif';
+  ctx.fillText('WORMS', W/2, H * 0.11);
+
+  // فیلد اسم
+  nm.style.display = 'block';
+  nm.style.top = Math.round(H * 0.15) + 'px';
+
+  // پیش‌نمایش طرح
+  const m = MENU_SKINS[settings.sel];
+  const sk = m.random ? SKINS[Math.floor(time / 500) % SKINS.length] : m;
+  const py = H * 0.38;
+  drawPreview(sk, W/2 - 8, py, time);
+
+  setRect(MR.left, 12, py - 28, 52, 56);
+  setRect(MR.right, W - 64, py - 28, 52, 56);
+  drawBtn(MR.left, '<', 'rgba(255,255,255,0.14)', '#fff', 30);
+  drawBtn(MR.right, '>', 'rgba(255,255,255,0.14)', '#fff', 30);
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 22px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(m.name.toUpperCase(), W/2, py + 62);
+  ctx.font = 'bold 13px sans-serif';
+  if (m.vip) { ctx.fillStyle = '#ffd60a'; ctx.fillText('★ EXCLUSIVE', W/2, py + 84); }
+  else if (m.random) { ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.fillText('NEW SKIN EVERY TIME', W/2, py + 84); }
+  else { ctx.fillStyle = 'rgba(255,255,255,0.4)'; ctx.fillText('CLASSIC', W/2, py + 84); }
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.fillText((settings.sel + 1) + ' / ' + MENU_SKINS.length, W/2, py + 104);
+
+  // سختی
+  const rowW = Math.min(W - 48, 340);
+  const gap = 8;
+  const bw = (rowW - gap * 2) / 3;
+  const dx0 = (W - rowW) / 2;
+  const dy = H * 0.59;
+  for (let i = 0; i < 3; i++) {
+    setRect(MR.diff[i], dx0 + i * (bw + gap), dy, bw, 46);
+    const on = settings.diff === i;
+    drawBtn(MR.diff[i], DIFFS[i].name, on ? '#7CFC00' : 'rgba(255,255,255,0.12)', on ? '#12151f' : '#fff', 15);
+  }
+
+  // صدا
+  setRect(MR.sound, (W - 180) / 2, dy + 46 + 14, 180, 42);
+  drawBtn(MR.sound, 'SOUND: ' + (settings.sound ? 'ON' : 'OFF'),
+    settings.sound ? 'rgba(124,252,0,0.25)' : 'rgba(255,255,255,0.12)', '#fff', 15);
+
+  // شروع
+  const pw = Math.min(300, W - 60);
+  setRect(MR.play, (W - pw) / 2, H * 0.80, pw, 60);
+  drawBtn(MR.play, 'PLAY', '#7CFC00', '#12151f', 26);
+
+  ctx.fillStyle = '#ffd60a';
+  ctx.font = 'bold 15px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('BEST: ' + best, W/2, H * 0.80 + 60 + 30);
+}
+
+function drawGameOver(){
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, c.width, c.height);
+
+  const pw = Math.min(340, c.width - 40), ph = 420;
+  const px = (c.width - pw) / 2, py = (c.height - ph) / 2;
+  ctx.fillStyle = '#242842';
+  ctx.beginPath(); ctx.roundRect(px, py, pw, ph, 24); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  const cx = c.width / 2;
+  ctx.textAlign = 'center';
+
+  ctx.fillStyle = '#ff4d6d';
+  ctx.font = 'bold 34px sans-serif';
+  ctx.fillText('GAME OVER', cx, py + 56);
+
+  if (newRecord) {
+    ctx.fillStyle = '#ffd60a';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.fillText('NEW RECORD!', cx, py + 84);
+  }
+
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillText('SCORE', cx, py + 122);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 46px sans-serif';
+  ctx.fillText(finalScore, cx, py + 170);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillText('BEST', cx, py + 208);
+  ctx.fillStyle = '#ffd60a';
+  ctx.font = 'bold 30px sans-serif';
+  ctx.fillText(best, cx, py + 244);
+
+  const ready = overT > 0.5;
+  setRect(overBtn, px + 30, py + ph - 138, pw - 60, 54);
+  drawBtn(overBtn, 'PLAY AGAIN', ready ? '#7CFC00' : 'rgba(124,252,0,0.35)', '#12151f', 22);
+  setRect(menuBtn, px + 30, py + ph - 72, pw - 60, 46);
+  drawBtn(menuBtn, 'MENU', ready ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.07)', '#fff', 18);
+}
+
+function drawUI(time){
+  if (state !== 'menu') nm.style.display = 'none';
+
+  if (state === 'menu') {
+    drawMenu(time);
+    return;
+  }
+
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = 'bold 16px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(DIFFS[settings.diff].name, c.width/2, 40);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 40px sans-serif';
+  ctx.fillText(Math.floor(state === 'play' ? worm.score : finalScore), c.width/2, 80);
+
+  drawBoard();
+
+  if (state === 'play') {
+    drawLeaderArrow();
+    drawMinimap();
+
+    if (joy.active) {
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.beginPath(); ctx.arc(joy.ox, joy.oy, JOY_R, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
+      ctx.beginPath(); ctx.arc(joy.x, joy.y, KNOB_R, 0, Math.PI*2); ctx.fill();
+    }
+
+    ctx.fillStyle = btn.pressed ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.15)';
+    ctx.beginPath();
+    ctx.roundRect(btn.x, btn.y, btn.size, btn.size, 22);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = 6;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    const cx = btn.x + btn.size/2;
+    for (let i = 0; i < 3; i++) {
+      const cy = btn.y + 38 + i*20;
+      ctx.beginPath();
+      ctx.moveTo(cx - 20, cy + 8);
+      ctx.lineTo(cx, cy - 8);
+      ctx.lineTo(cx + 20, cy + 8);
+      ctx.stroke();
+    }
+  } else {
+    drawGameOver();
+  }
+}
+
+let last = performance.now();
+function loop(now){
+  NOW = now;
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 0.05) dt = 0.05;
+
+  ctx.fillStyle = '#1a1d2b';
+  ctx.fillRect(0,0,c.width,c.height);
+  update(dt);
+  drawWorld(now);
+  drawUI(now);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
