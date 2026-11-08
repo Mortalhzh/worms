@@ -2,6 +2,10 @@
 <html>
 <head>
 <meta charset="utf-8">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1a1d2b">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <style>
   html,body{margin:0;height:100%;background:#1a1d2b;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
@@ -1078,5 +1082,6 @@ function loop(now){
 }
 requestAnimationFrame(loop);
 </script>
+<script>if("serviceWorker" in navigator){navigator.serviceWorker.register("sw.js").catch(function(){});}</script>
 </body>
 </html>
